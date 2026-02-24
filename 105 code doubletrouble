@@ -1,0 +1,120 @@
+###############################################################################
+# Purpose
+# -------
+# This script:
+#  1) Reads a proteome FASTA and a GFF annotation from *folders* using syntenet
+#  2) Ensures protein IDs in FASTA match gene IDs in the GFF (critical!)
+#  3) Processes input into syntenet’s standardized format
+#  4) Runs DIAMOND all-vs-all similarity searching
+#  5) Uses doubletrouble to classify duplicate gene pairs
+#  
+###############################################################################
+
+###############################################################################
+# 0) Load libraries (only once; remove duplicates)
+###############################################################################
+library(syntenet)        # reading FASTA/GFF, processing input, running DIAMOND
+library(GenomicRanges)   # working with GRanges, mcols(), feature filtering
+library(doubletrouble)   # classifying duplicate gene pairs from blast + annotation
+library(data.table)      # fast writing + fast grouping summaries
+library(rtracklayer)     # import() comes from rtracklayer (Bioconductor), not base R.
+#BiocManager::install(c("GenomicRanges","IRanges"))
+
+###############################################################################
+# 1) Read inputs from files
+#    - "proteome" should contain one or more FASTA files
+#    - "gff"      should contain one or more GFF/GTF files
+#
+# syntenet returns *named lists* (or list-like objects) keyed by species/genome.
+###############################################################################
+seqs  <- syntenet::fasta2AAStringSetlist("proteome")  # proteins as AAStringSet(s)
+annot <- syntenet::gff2GRangesList("gff")             # annotations as GRangesList
+gff <- import("genomic.gff")
+
+
+###############################################################################
+# 2)  
+/groups/macias-munoz_lab/doubletroubleopsin
+which diamond
+diamond --version
+
+seqs105  <- syntenet::fasta2AAStringSetlist("proteome105")  # proteins as AAStringSet(s)
+annot105 <- syntenet::gff2GRangesList("gff105")             # annotations as GRangesList
+
+names(seqsAEP)  <- "AEP"
+names(annotAEP) <- "AEP"
+
+names(seqs105)  <- "105"
+names(annot105) <- "105"
+
+
+# See what metadata columns exist
+colnames(mcols(annot105[["105"]]))
+head(mcols(annot105[["105"]]), 3)
+# Keep only gene rows
+annot105[["105"]] <- annot105[["105"]][mcols(annot105[["105"]])$type == "gene"]
+
+# Create gene_id column from the correct ID field
+if ("ID" %in% colnames(mcols(annot105[["105"]]))) {
+  mcols(annot105[["105"]])$gene_id <- mcols(annot105[["105"]])$ID
+} else if ("ID_" %in% colnames(mcols(annot105[["105"]]))) {
+  mcols(annot105[["105"]])$gene_id <- mcols(annot105[["105"]])$ID_
+} else if ("gene_id" %in% colnames(mcols(annot105[["105"]]))) {
+  # already present, do nothing
+} else {
+  stop("Could not find an ID column. Run: head(mcols(annot105[[\"105\"]])) and paste it here.")
+}
+
+# sanity check
+head(mcols(annot105[["105"]])[, c("type","gene_id")])
+
+ nrow(mcols(annot105[["105"]])[, c("type","gene_id")])
+[1] 28314
+#remove the "gene-"
+mcols(annot105[["105"]])$gene_id <- sub("^gene-", "", mcols(annot105[["105"]])$gene_id)
+
+#Issues begin here:
+> sum(names(seqs105[["105"]]) %in% mcols(annot105[["105"]])$gene_id)
+[1] 0
+> seqs105_renamed <- seqs105[["105"]]
+names(seqs105_renamed) <- sub(".*(LOC[0-9]{9}).*", "\\1", names(seqs105_renamed))
+
+# keep only entries that actually had a LOC id in the header (drops NP_/YP_ names without LOC)
+keep <- grepl("^LOC[0-9]{9}$", names(seqs105_renamed))
+seqs105_renamed <- seqs105_renamed[keep]
+
+# put back into the list format syntenet expects
+seqs1052 <- list("105" = seqs105_renamed)
+
+# quick sanity check: should now be >0
+sum(names(seqs1052[["105"]]) %in% mcols(annot105[["105"]])$gene_id)
+[1] 14436
+>
+annot105_2 <- annot105
+annot105_2[["105"]] <- annot105_2[["105"]][mcols(annot105_2[["105"]])$gene_id %in% names(seqs1052[["105"]])]
+
+# sanity check: should equal 14436 (or very close) SPOILER ITS NOT
+length(annot105_2[["105"]])
+
+proc105 <- syntenet::process_input(
+  seq        = seqs1052u,
+  annotation = annot105_2)
+blast_list105 <- syntenet::run_diamond(
+  seq     = proc105$seq,
+  threads = 8
+)
+
+dup_pairs105 <- doubletrouble::classify_gene_pairs(
+  annotation = proc105$annotation,
+  blast_list = blast_list105,
+  scheme     = "standard"
+)
+##################
+
+dup_pairs105 <- doubletrouble::classify_gene_pairs(
+  annotation = proc105$annotation,
+  scheme = "standard"
+)
+
+head(dup_pairs[["105"]])
+table(dup_pairs[["105"]]$type)
