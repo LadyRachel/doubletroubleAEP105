@@ -1,0 +1,222 @@
+###############################################################################
+# Purpose
+# -------
+# This script:
+#  1) Reads a proteome FASTA and a GFF annotation from *folders* using syntenet
+#  2) Ensures protein IDs in FASTA match gene IDs in the GFF (critical!)
+#  3) Processes input into syntenet’s standardized format
+#  4) Runs DIAMOND all-vs-all similarity searching
+#  5) Uses doubletrouble to classify duplicate gene pairs
+#  
+###############################################################################
+
+library(syntenet)        # reading FASTA/GFF, processing input, running DIAMOND
+library(GenomicRanges)   # working with GRanges, mcols(), feature filtering
+library(doubletrouble)   # classifying duplicate gene pairs from blast + annotation
+library(data.table)      # fast writing + fast grouping summaries
+library(readr)          # read_tsv(), write_tsv()
+library(dplyr)          # data manipulation
+library(ggplot2)        # ggsave()
+
+
+###############################################################################
+# 1) Read inputs from folders (syntenet cant do individual files)
+#    - "proteome" should contain one or more FASTA files
+#    - "gff"      should contain one or more GFF/GTF files
+###############################################################################
+seqsAEP  <- syntenet::fasta2AAStringSetlist("proteomeAEP")  # proteins as AAStringSet(s)
+annotAEP <- syntenet::gff2GRangesList("gffAEP")             # annotations as GRangesList
+
+###############################################################################
+# 2) Name the genomes/species consistently bc syntenet matches seqs and annot *by list name*
+###############################################################################
+names(seqsAEP)  <- "AEP"
+names(annotAEP) <- "AEP"
+
+names(seqs105)  <- "105"
+names(annot105) <- "105"
+
+
+###############################################################################
+# 3) Inspect annotation metadata to find the correct ID field!!!!! bc doubletrouble expects a gene_id column. That gene_id must match the protein headers you give syntenet 
+# I have both both ID and an ID_ field—so we inspect to be sure.
+###############################################################################
+colnames(mcols(annotAEP$AEP))       # show what metadata columns exist
+head(mcols(annotAEP$AEP), 3)        # peek at first 3 features’ metadata
+
+
+###############################################################################
+# 4) Standardize FASTA headers so they match the gene IDs in the GFF
+#    Why this matters:
+#      - syntenet::process_input() tries to match protein IDs to annotation IDs
+#      - if FASTA headers include extra description text, they won’t match
+#
+# Example: If FASTA headers look like:
+#   HVAEP1.G001381 some description blah blah
+# we want to keep only:
+#   HVAEP1.G001381
+#
+# The regex below keeps the first token that matches HVAEP#.G###### and drops
+# everything after it.
+###############################################################################
+names(seqsAEP$AEP) <- sub("^(HVAEP\\d+\\.G\\d{6}).*$", "\\1", names(seqsAEP$AEP))
+
+###############################################################################
+# 5) Keep only gene features in the GFF and create a gene_id column
+#    Why:
+#      - GFF contains many feature types (gene, mRNA, CDS, exon, etc.)
+#      - for duplication classification, you typically want gene-level coordinates
+#      - doubletrouble expects a metadata column named gene_id
+#
+# Steps:
+#   a) copy annot -> annot_gene (so we don’t destroy the original)
+#   b) filter to type == "gene"
+#   c) create mcols(...)$gene_id from the correct ID-like field
+###############################################################################
+annot_gene <- annotAEP
+
+# a) Filter GRanges to keep only features whose "type" metadata is "gene"
+#    (This assumes your gff2GRangesList stored feature type in mcols()$type.)
+annot_gene$AEP <- annot_gene$AEP[mcols(annot_gene$AEP)$type == "gene"]
+
+# b) Create a gene_id column.
+#    Choose the right field based on what your GFF actually contains.
+#    Common cases:
+#      - if colnames include "ID": use mcols(...)$ID
+
+# Here we prefer "ID" if present; otherwise fall back to "ID_".
+#if ("ID" %in% colnames(mcols(annot_gene$AEP))) {
+#  mcols(annot_gene$AEP)$gene_id <- mcols(annot_gene$AEP)$ID
+#} else if ("ID_" %in% colnames(mcols(annot_gene$AEP))) {
+#  mcols(annot_gene$AEP)$gene_id <- mcols(annot_gene$AEP)$ID_
+#} else {
+#  stop("Could not find an ID or ID_ column in the GFF metadata to create gene_id.")
+#}
+
+mcols(annot_gene$AEP)$gene_id <- mcols(annot_gene$AEP)$ID
+###############################################################################
+# 6) Process inputs for syntenet
+#    syntenet::process_input() typically:
+#      - checks formatting
+#      - harmonizes IDs between sequences and annotation
+#      - returns a list with at least:
+#          $seq        (cleaned AAStringSetlist)
+#          $annotation (cleaned GRangesList)
+#
+# If IDs don’t match, this is where you usually notice (e.g., low overlap).
+###############################################################################
+proc <- syntenet::process_input(seqsAEP, annot_gene)
+
+# Sanity checks:
+#  - proc$seq$AEP length: number of protein sequences retained
+#  - proc$annotation$AEP length: number of gene features retained
+length(proc$seq$AEP)
+length(proc$annotation$AEP)
+
+
+###############################################################################
+# 7) Run DIAMOND all-vs-all to get similarity hits ("blast_list")
+#    Why:
+#      - doubletrouble classifies duplicates based on similarity + genomic context
+#      - syntenet::run_diamond() produces a list of BLAST-like hits per genome
+#
+# Note: threads controls CPU usage.
+###############################################################################
+blast_list <- syntenet::run_diamond(proc$seq, threads = 8)
+
+
+###############################################################################
+# 8) Classify duplicate gene pairs with doubletrouble
+#    Inputs:
+#      - annotation: gene coordinates (proc$annotation)
+#      - blast_list: similarity hits (blast_list)
+#      - scheme: ruleset; "standard" is the common default
+#
+# Output:
+#   dup_pairs is usually a list keyed by genome name (here "AEP"),
+#   where dup_pairs$AEP is a data.frame-like table of duplicate pairs.
+###############################################################################
+dup_pairs <- doubletrouble::classify_gene_pairs(
+  annotation = proc$annotation,
+  blast_list = blast_list,
+  scheme     = "standard"
+)
+
+# Quick look at results:
+head(dup_pairs$AEP)
+table(dup_pairs$AEP$type)   # counts of each duplicate class/type
+
+
+###############################################################################
+# 9) Filter duplicate pairs down to those involving opsins
+#    You provide a text file "AEP.txt" with one opsin ID per line.
+#
+# Cleaning steps:
+#   - remove empty lines
+#   - remove a header line like "AEP" if present
+#   - trim whitespace
+#
+# Also: some pipelines prefix IDs in dup_pairs with "AEP_" (e.g., AEP_HVAEP1...)
+# If so, strip that prefix so dup1/dup2 match your opsin IDs.
+###############################################################################
+opsins <- readLines("AEP.txt")
+opsins <- trimws(opsins)                 # remove leading/trailing whitespace
+opsins <- opsins[nzchar(opsins)]         # drop empty strings
+opsins <- opsins[opsins != "AEP"]        # drop accidental header line if present
+
+# If dup_pairs genes have a leading "AEP_" prefix, remove it.
+# This makes "AEP_HVAEP1.G001381" become "HVAEP1.G001381".
+dup_pairs$AEP$dup1 <- sub("^AEP_", "", dup_pairs$AEP$dup1)
+dup_pairs$AEP$dup2 <- sub("^AEP_", "", dup_pairs$AEP$dup2)
+
+# Now filter to rows where either member of the pair is in your opsin list.
+opsin_pairs <- dup_pairs$AEP[
+  dup_pairs$AEP$dup1 %in% opsins | dup_pairs$AEP$dup2 %in% opsins,
+]
+
+# Inspect filtered results
+nrow(opsin_pairs)
+head(opsin_pairs)
+table(opsin_pairs$type)
+
+# Save the filtered duplicate-pair table to disk
+data.table::fwrite(
+  opsin_pairs,
+  file = "AEP_opsin_duplicate_pairs.tsv",
+  sep  = "\t"
+)
+
+
+###############################################################################
+# 10) Summarize: for each opsin, how many duplicate pairs of each type?
+#     Approach:
+#       - Convert to data.table for fast grouping
+#       - Count occurrences where opsin appears as dup1
+#       - Count occurrences where opsin appears as dup2
+#       - Combine and sum to get total per opsin per type
+###############################################################################
+dt <- as.data.table(opsin_pairs)
+
+opsin_counts <- rbind(
+  # Count pairs where the opsin is in the first column (dup1)
+  dt[dup1 %in% opsins, .N, by = .(opsin = dup1, type)],
+
+  # Count pairs where the opsin is in the second column (dup2)
+  dt[dup2 %in% opsins, .N, by = .(opsin = dup2, type)]
+)[
+  # After stacking, sum counts (N) across dup1/dup2 contributions
+  , .(n_pairs = sum(N)), by = .(opsin, type)
+][
+  # Sort so the most-connected opsins appear first
+  order(-n_pairs)
+]
+
+# Write summary table
+fwrite(
+  opsin_counts,
+  file = "AEP_opsin_dup_counts_by_type.tsv",
+  sep  = "\t"
+)
+
+# Show top 20
+head(opsin_counts, 20)
